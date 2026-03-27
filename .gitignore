@@ -5,4 +5,7 @@ logs/
 .DS_Store
 evals/MorphoLex-en/
 .venv/
-tokenizer/output/
+tokenizer/output*/
+data/fineweb*_morph*/
+data/fineweb*_vanilla*/
+data/fineweb*_morpheme*/
