@@ -380,13 +380,17 @@ class MorphologicalBPETrainer:
         for i in range(256):
             mergeable_ranks[bytes([i])] = i
 
-        # Merged tokens: sorted by merge order (token ID)
+        # Merged tokens: sorted by merge order (token ID).
+        # Keep the first (lowest ID) entry for each byte sequence so that
+        # forced morpheme merges are never overwritten by statistical merges
+        # that happen to produce the same byte sequence via a different path.
         sorted_merges = sorted(self.merges.items(), key=lambda x: x[1])
         for (left, right), merged_id in sorted_merges:
             left_bytes = self.vocab[left]
             right_bytes = self.vocab[right]
             merged_bytes = left_bytes + right_bytes
-            mergeable_ranks[merged_bytes] = merged_id
+            if merged_bytes not in mergeable_ranks:
+                mergeable_ranks[merged_bytes] = merged_id
 
         return mergeable_ranks
 
