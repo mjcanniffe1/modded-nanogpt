@@ -22,6 +22,9 @@ import json
 import pickle
 import argparse
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from morphological_bpe import MorphologicalBPETrainer
 from morphemes import DEFAULT_MORPHEMES
 
