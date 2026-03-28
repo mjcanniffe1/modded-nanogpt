@@ -481,19 +481,25 @@ def main():
     print("=" * 60)
     try:
         from tokenization_scorer import score
+        # tokenization_scorer expects lines of space-separated token strings
         ids = enc.encode(eval_text)
-        renyi = score(ids, alpha=2.5)
+        token_lines = [" ".join(str(t) for t in ids)]
+        renyi = score(token_lines, alpha=2.5)
         results["renyi_efficiency"] = renyi
         print(f"  Renyi efficiency (alpha=2.5): {renyi:.4f}")
 
         if baseline_enc:
             baseline_ids = baseline_enc.encode(eval_text)
-            baseline_renyi = score(baseline_ids, alpha=2.5)
+            baseline_lines = [" ".join(str(t) for t in baseline_ids)]
+            baseline_renyi = score(baseline_lines, alpha=2.5)
             results["baseline_renyi"] = baseline_renyi
             print(f"  Baseline Renyi: {baseline_renyi:.4f}")
     except ImportError:
         print("  tokenization-scorer not installed. Install with:")
         print("  pip install tokenization-scorer")
+        results["renyi_efficiency"] = None
+    except Exception as e:
+        print(f"  Renyi efficiency failed: {e}")
         results["renyi_efficiency"] = None
 
     # ── Summary ──
