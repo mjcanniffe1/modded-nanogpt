@@ -20,6 +20,11 @@ import tiktoken
 
 GPT4_SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
 
+# Penalty multiplier for merges that cross a morpheme boundary.
+# A pair touching a morpheme token must be this many times more frequent
+# than a normal pair to be selected. 0.1 = 10x penalty.
+MORPH_BOUNDARY_PENALTY = 0.1
+
 
 def _merge_inplace(ids, pair, new_id):
     """Replace all non-overlapping occurrences of pair with new_id, in place."""
@@ -48,7 +53,14 @@ class MorphologicalBPETrainer:
         self.merges = {}       # (int, int) -> int
         self.vocab = {}        # int -> bytes
         self.forced_merge_count = 0
-        self.protected_tokens = set()  # Final morpheme token IDs (won't be consumed)
+        self.protected_tokens = set()  # Final morpheme token IDs
+
+    def _pair_score(self, pair, stats):
+        """Score a pair for merge selection, applying penalty for morpheme-crossing pairs."""
+        score = stats[pair]
+        if pair[0] in self.protected_tokens or pair[1] in self.protected_tokens:
+            score *= MORPH_BOUNDARY_PENALTY
+        return score
 
     def _apply_forced_merges(self, ids_list, morphemes):
         """
@@ -98,8 +110,7 @@ class MorphologicalBPETrainer:
                 # Collapse first two tokens into the merged token
                 token_seq = [merged_id] + token_seq[2:]
 
-            # The final single token is the complete morpheme — protect it
-            # from being consumed by later statistical merges
+            # The final single token is the complete morpheme
             if len(token_seq) == 1:
                 self.protected_tokens.add(token_seq[0])
 
@@ -143,15 +154,13 @@ class MorphologicalBPETrainer:
         merges_done = len(self.merges)
 
         # Phase 2: Statistical BPE for remaining merge budget
-        # Build initial pair counts, excluding pairs that contain protected
-        # morpheme tokens (so morpheme tokens survive to the final output)
+        # All pairs tracked — morpheme-crossing pairs get a frequency penalty
+        # during selection instead of being blocked outright.
         stats = defaultdict(int)
         positions = defaultdict(set)  # pair -> set of chunk indices
 
         for chunk_idx, (chunk_ids, count) in enumerate(zip(ids_list, chunk_counts)):
             for pair in zip(chunk_ids, chunk_ids[1:]):
-                if pair[0] in self.protected_tokens or pair[1] in self.protected_tokens:
-                    continue
                 stats[pair] += count
                 positions[pair].add(chunk_idx)
 
@@ -159,16 +168,10 @@ class MorphologicalBPETrainer:
             if not stats:
                 break
 
-            # Find the pair with the highest count
-            pair = max(stats, key=stats.get)
-            if stats[pair] <= 0:
+            # Find the pair with the highest penalized score
+            pair = max(stats, key=lambda p: self._pair_score(p, stats))
+            if self._pair_score(pair, stats) <= 0:
                 break
-
-            # Skip pairs that would consume a protected morpheme token
-            if pair[0] in self.protected_tokens or pair[1] in self.protected_tokens:
-                del stats[pair]
-                positions.pop(pair, None)
-                continue
 
             # Assign next available ID
             new_id = 256 + merges_done
@@ -211,9 +214,6 @@ class MorphologicalBPETrainer:
             # Apply incremental count changes
             for changed_pair, delta in count_changes.items():
                 if changed_pair == pair:
-                    continue
-                # Don't track pairs involving protected morpheme tokens
-                if changed_pair[0] in self.protected_tokens or changed_pair[1] in self.protected_tokens:
                     continue
                 stats[changed_pair] += delta
                 # Update positions
@@ -279,29 +279,21 @@ class MorphologicalBPETrainer:
 
         merges_done = len(self.merges)
 
-        # Phase 2: Statistical BPE (excluding pairs that consume protected morpheme tokens)
+        # Phase 2: Statistical BPE (penalty scoring for morpheme-crossing pairs)
         stats = defaultdict(int)
         positions = defaultdict(set)
 
         for chunk_idx, (chunk_ids, count) in enumerate(zip(ids_list, chunk_counts)):
             for pair in zip(chunk_ids, chunk_ids[1:]):
-                if pair[0] in self.protected_tokens or pair[1] in self.protected_tokens:
-                    continue
                 stats[pair] += count
                 positions[pair].add(chunk_idx)
 
         while merges_done < num_merges:
             if not stats:
                 break
-            pair = max(stats, key=stats.get)
-            if stats[pair] <= 0:
+            pair = max(stats, key=lambda p: self._pair_score(p, stats))
+            if self._pair_score(pair, stats) <= 0:
                 break
-
-            # Skip pairs that would consume a protected morpheme token
-            if pair[0] in self.protected_tokens or pair[1] in self.protected_tokens:
-                del stats[pair]
-                positions.pop(pair, None)
-                continue
 
             new_id = 256 + merges_done
             self.merges[pair] = new_id
@@ -335,8 +327,6 @@ class MorphologicalBPETrainer:
 
             for changed_pair, delta in count_changes.items():
                 if changed_pair == pair:
-                    continue
-                if changed_pair[0] in self.protected_tokens or changed_pair[1] in self.protected_tokens:
                     continue
                 stats[changed_pair] += delta
                 for chunk_idx in affected_chunks:
