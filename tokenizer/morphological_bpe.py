@@ -98,8 +98,7 @@ class MorphologicalBPETrainer:
                 # Collapse first two tokens into the merged token
                 token_seq = [merged_id] + token_seq[2:]
 
-            # The final single token is the complete morpheme — protect it
-            # from being consumed by later statistical merges
+            # Track final morpheme token IDs (used by knockout in get_mergeable_ranks)
             if len(token_seq) == 1:
                 self.protected_tokens.add(token_seq[0])
 
@@ -143,15 +142,13 @@ class MorphologicalBPETrainer:
         merges_done = len(self.merges)
 
         # Phase 2: Statistical BPE for remaining merge budget
-        # Build initial pair counts, excluding pairs that contain protected
-        # morpheme tokens (so morpheme tokens survive to the final output)
+        # No protection during training — merges that cross morpheme boundaries
+        # are knocked out post-hoc in get_mergeable_ranks().
         stats = defaultdict(int)
         positions = defaultdict(set)  # pair -> set of chunk indices
 
         for chunk_idx, (chunk_ids, count) in enumerate(zip(ids_list, chunk_counts)):
             for pair in zip(chunk_ids, chunk_ids[1:]):
-                if pair[0] in self.protected_tokens or pair[1] in self.protected_tokens:
-                    continue
                 stats[pair] += count
                 positions[pair].add(chunk_idx)
 
@@ -163,12 +160,6 @@ class MorphologicalBPETrainer:
             pair = max(stats, key=stats.get)
             if stats[pair] <= 0:
                 break
-
-            # Skip pairs that would consume a protected morpheme token
-            if pair[0] in self.protected_tokens or pair[1] in self.protected_tokens:
-                del stats[pair]
-                positions.pop(pair, None)
-                continue
 
             # Assign next available ID
             new_id = 256 + merges_done
@@ -211,9 +202,6 @@ class MorphologicalBPETrainer:
             # Apply incremental count changes
             for changed_pair, delta in count_changes.items():
                 if changed_pair == pair:
-                    continue
-                # Don't track pairs involving protected morpheme tokens
-                if changed_pair[0] in self.protected_tokens or changed_pair[1] in self.protected_tokens:
                     continue
                 stats[changed_pair] += delta
                 # Update positions
@@ -279,14 +267,12 @@ class MorphologicalBPETrainer:
 
         merges_done = len(self.merges)
 
-        # Phase 2: Statistical BPE (excluding pairs that consume protected morpheme tokens)
+        # Phase 2: Statistical BPE (no protection — knockout applied post-hoc)
         stats = defaultdict(int)
         positions = defaultdict(set)
 
         for chunk_idx, (chunk_ids, count) in enumerate(zip(ids_list, chunk_counts)):
             for pair in zip(chunk_ids, chunk_ids[1:]):
-                if pair[0] in self.protected_tokens or pair[1] in self.protected_tokens:
-                    continue
                 stats[pair] += count
                 positions[pair].add(chunk_idx)
 
@@ -296,12 +282,6 @@ class MorphologicalBPETrainer:
             pair = max(stats, key=stats.get)
             if stats[pair] <= 0:
                 break
-
-            # Skip pairs that would consume a protected morpheme token
-            if pair[0] in self.protected_tokens or pair[1] in self.protected_tokens:
-                del stats[pair]
-                positions.pop(pair, None)
-                continue
 
             new_id = 256 + merges_done
             self.merges[pair] = new_id
@@ -335,8 +315,6 @@ class MorphologicalBPETrainer:
 
             for changed_pair, delta in count_changes.items():
                 if changed_pair == pair:
-                    continue
-                if changed_pair[0] in self.protected_tokens or changed_pair[1] in self.protected_tokens:
                     continue
                 stats[changed_pair] += delta
                 for chunk_idx in affected_chunks:
@@ -404,7 +382,21 @@ class MorphologicalBPETrainer:
         return new_ids
 
     def get_mergeable_ranks(self):
-        """Build the mergeable_ranks dict for tiktoken: bytes -> rank."""
+        """
+        Build the mergeable_ranks dict for tiktoken: bytes -> rank.
+
+        BPE-knockout: after building the full merge table, remove any merge
+        whose byte sequence crosses a morpheme boundary. A merge "crosses"
+        if its bytes contain a morpheme as a proper prefix or suffix
+        (meaning the merge glued a morpheme to non-morpheme bytes).
+        Morpheme-only entries and non-morpheme entries are kept.
+        """
+        # Build morpheme byte sequences for knockout matching
+        morpheme_bytes_set = set()
+        for token_id in self.protected_tokens:
+            if token_id in self.vocab:
+                morpheme_bytes_set.add(self.vocab[token_id])
+
         mergeable_ranks = {}
 
         # Single bytes: rank 0..255
@@ -412,16 +404,23 @@ class MorphologicalBPETrainer:
             mergeable_ranks[bytes([i])] = i
 
         # Merged tokens: sorted by merge order (token ID).
-        # Keep the first (lowest ID) entry for each byte sequence so that
-        # forced morpheme merges are never overwritten by statistical merges
-        # that happen to produce the same byte sequence via a different path.
         sorted_merges = sorted(self.merges.items(), key=lambda x: x[1])
         for (left, right), merged_id in sorted_merges:
             left_bytes = self.vocab[left]
             right_bytes = self.vocab[right]
             merged_bytes = left_bytes + right_bytes
-            if merged_bytes not in mergeable_ranks:
-                mergeable_ranks[merged_bytes] = merged_id
+
+            if merged_bytes in mergeable_ranks:
+                continue
+
+            # Knockout check: skip merges that cross a morpheme boundary.
+            # A merge crosses if one side is a morpheme and the other isn't.
+            left_is_morph = left_bytes in morpheme_bytes_set
+            right_is_morph = right_bytes in morpheme_bytes_set
+            if left_is_morph != right_is_morph:
+                continue  # knocked out
+
+            mergeable_ranks[merged_bytes] = merged_id
 
         return mergeable_ranks
 
