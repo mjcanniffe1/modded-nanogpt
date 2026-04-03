@@ -98,9 +98,11 @@ class MorphologicalBPETrainer:
                 # Collapse first two tokens into the merged token
                 token_seq = [merged_id] + token_seq[2:]
 
-            # The final single token is the complete morpheme — protect it
-            # from being consumed by later statistical merges
-            if len(token_seq) == 1:
+            # Protect 3+ byte morphemes from consumption. Short 2-byte ones
+            # (er, al, in, ed) keep forced merge priority but can be consumed.
+            # Protected morphemes can still merge with OTHER protected morphemes
+            # (soft protection — e.g., tion+al -> tional is allowed).
+            if len(token_seq) == 1 and len(morpheme_bytes) >= 3:
                 self.protected_tokens.add(token_seq[0])
 
         return merges_created
@@ -143,14 +145,16 @@ class MorphologicalBPETrainer:
         merges_done = len(self.merges)
 
         # Phase 2: Statistical BPE for remaining merge budget
-        # Build initial pair counts, excluding pairs that contain protected
-        # morpheme tokens (so morpheme tokens survive to the final output)
+        # Soft protection: block only mixed pairs (one protected + one not).
+        # Morpheme+morpheme merges are allowed (e.g., tion+al -> tional).
         stats = defaultdict(int)
         positions = defaultdict(set)  # pair -> set of chunk indices
 
         for chunk_idx, (chunk_ids, count) in enumerate(zip(ids_list, chunk_counts)):
             for pair in zip(chunk_ids, chunk_ids[1:]):
-                if pair[0] in self.protected_tokens or pair[1] in self.protected_tokens:
+                lp = pair[0] in self.protected_tokens
+                rp = pair[1] in self.protected_tokens
+                if lp != rp:
                     continue
                 stats[pair] += count
                 positions[pair].add(chunk_idx)
@@ -164,8 +168,10 @@ class MorphologicalBPETrainer:
             if stats[pair] <= 0:
                 break
 
-            # Skip pairs that would consume a protected morpheme token
-            if pair[0] in self.protected_tokens or pair[1] in self.protected_tokens:
+            # Soft protection: block only mixed pairs
+            lp = pair[0] in self.protected_tokens
+            rp = pair[1] in self.protected_tokens
+            if lp != rp:
                 del stats[pair]
                 positions.pop(pair, None)
                 continue
@@ -174,6 +180,10 @@ class MorphologicalBPETrainer:
             new_id = 256 + merges_done
             self.merges[pair] = new_id
             self.vocab[new_id] = self.vocab[pair[0]] + self.vocab[pair[1]]
+
+            # Propagate protection to morpheme+morpheme merges
+            if lp and rp:
+                self.protected_tokens.add(new_id)
 
             if verbose and (merges_done % 100 == 0 or merges_done < 10):
                 print(f"merge {merges_done}/{num_merges}: {pair} -> {new_id} "
@@ -212,8 +222,9 @@ class MorphologicalBPETrainer:
             for changed_pair, delta in count_changes.items():
                 if changed_pair == pair:
                     continue
-                # Don't track pairs involving protected morpheme tokens
-                if changed_pair[0] in self.protected_tokens or changed_pair[1] in self.protected_tokens:
+                clp = changed_pair[0] in self.protected_tokens
+                crp = changed_pair[1] in self.protected_tokens
+                if clp != crp:
                     continue
                 stats[changed_pair] += delta
                 # Update positions
@@ -279,13 +290,15 @@ class MorphologicalBPETrainer:
 
         merges_done = len(self.merges)
 
-        # Phase 2: Statistical BPE (excluding pairs that consume protected morpheme tokens)
+        # Phase 2: Statistical BPE (soft protection: morpheme+morpheme OK)
         stats = defaultdict(int)
         positions = defaultdict(set)
 
         for chunk_idx, (chunk_ids, count) in enumerate(zip(ids_list, chunk_counts)):
             for pair in zip(chunk_ids, chunk_ids[1:]):
-                if pair[0] in self.protected_tokens or pair[1] in self.protected_tokens:
+                lp = pair[0] in self.protected_tokens
+                rp = pair[1] in self.protected_tokens
+                if lp != rp:
                     continue
                 stats[pair] += count
                 positions[pair].add(chunk_idx)
@@ -297,8 +310,9 @@ class MorphologicalBPETrainer:
             if stats[pair] <= 0:
                 break
 
-            # Skip pairs that would consume a protected morpheme token
-            if pair[0] in self.protected_tokens or pair[1] in self.protected_tokens:
+            lp = pair[0] in self.protected_tokens
+            rp = pair[1] in self.protected_tokens
+            if lp != rp:
                 del stats[pair]
                 positions.pop(pair, None)
                 continue
@@ -306,6 +320,9 @@ class MorphologicalBPETrainer:
             new_id = 256 + merges_done
             self.merges[pair] = new_id
             self.vocab[new_id] = self.vocab[pair[0]] + self.vocab[pair[1]]
+
+            if lp and rp:
+                self.protected_tokens.add(new_id)
 
             if verbose and (merges_done % 500 == 0):
                 print(f"merge {merges_done}/{num_merges}: {pair} -> {new_id} freq={stats[pair]}")
@@ -336,7 +353,9 @@ class MorphologicalBPETrainer:
             for changed_pair, delta in count_changes.items():
                 if changed_pair == pair:
                     continue
-                if changed_pair[0] in self.protected_tokens or changed_pair[1] in self.protected_tokens:
+                clp = changed_pair[0] in self.protected_tokens
+                crp = changed_pair[1] in self.protected_tokens
+                if clp != crp:
                     continue
                 stats[changed_pair] += delta
                 for chunk_idx in affected_chunks:
