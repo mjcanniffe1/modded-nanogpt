@@ -98,9 +98,11 @@ class MorphologicalBPETrainer:
                 # Collapse first two tokens into the merged token
                 token_seq = [merged_id] + token_seq[2:]
 
-            # The final single token is the complete morpheme — protect it
-            # from being consumed by later statistical merges
-            if len(token_seq) == 1:
+            # Protect 3+ byte morphemes from consumption by statistical merges.
+            # Short 2-byte morphemes (er, al, in, ed, etc.) keep their forced
+            # merges (low IDs = high priority) but CAN be consumed into larger
+            # tokens to reduce fragmentation.
+            if len(token_seq) == 1 and len(morpheme_bytes) >= 3:
                 self.protected_tokens.add(token_seq[0])
 
         return merges_created
